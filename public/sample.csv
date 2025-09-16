@@ -1,0 +1,5 @@
+product_name,price,quantity,in_stock,date_added,category
+Laptop,999.99,50,true,2024-01-15,Electronics
+Mouse,19.99,200,true,2024-01-20,Accessories
+Keyboard,79.99,0,false,2024-02-01,Accessories
+Monitor,299.99,25,true,2024-02-10,Electronics
