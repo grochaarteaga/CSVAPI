@@ -71,3 +71,11 @@ export interface UserSubscription {
   created_at: string
   updated_at: string
 }
+
+export interface CsvData {
+  id: string;
+  dataset_id: string;
+  row_number: number;
+  data: Record<string, any>; // JSONB data
+  created_at: string;
+}

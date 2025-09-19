@@ -1,191 +1,298 @@
-import { NextRequest, NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
-import { parseCSV } from '../../../lib/csv/parser'
-import { createTable, generateTableName } from '../../../lib/csv/table-creator'
-import { slugify } from '../../../lib/utils/slugify'
-import { nanoid } from 'nanoid'
+import { NextRequest, NextResponse } from 'next/server';
+import { createClient } from '@supabase/supabase-js';
+import Papa from 'papaparse';
+import { nanoid } from 'nanoid';
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
+const supabaseAdmin = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
 
 export async function POST(request: NextRequest) {
   try {
-    // Authenticate user
-    const supabase = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-    )
-
-    const authHeader = request.headers.get('authorization')
+    // Get auth token from header
+    const authHeader = request.headers.get('authorization');
     if (!authHeader) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const token = authHeader.replace('Bearer ', '')
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token)
+    // Verify user session
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(token);
 
     if (authError || !user) {
-      return NextResponse.json({ error: 'Invalid token' }, { status: 401 })
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     // Parse form data
-    const formData = await request.formData()
-    const file = formData.get('file') as File
-    const schemaOverride = formData.get('schema') as string
+    const formData = await request.formData();
+    const file = formData.get('file') as File;
+    const projectId = formData.get('projectId') as string;
 
     if (!file) {
-      return NextResponse.json({ error: 'No file provided' }, { status: 400 })
+      return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
     }
 
-    // Check file size
-    if (file.size > MAX_FILE_SIZE) {
-      return NextResponse.json({ error: 'File too large. Maximum 10MB allowed.' }, { status: 400 })
+    // Check file size (10MB limit for free tier)
+    if (file.size > 10 * 1024 * 1024) {
+      return NextResponse.json({ error: 'File too large. Maximum size is 10MB' }, { status: 400 });
     }
 
-    // Check user's subscription and project count
-    const { data: subscription, error: subError } = await supabase
-      .from('user_subscriptions')
-      .select('plan_name, is_active')
-      .eq('user_id', user.id)
-      .eq('is_active', true)
-      .single()
+    // Read and parse CSV
+    const text = await file.text();
+    const parseResult = Papa.parse(text, {
+      header: true,
+      dynamicTyping: true,
+      skipEmptyLines: true,
+      transformHeader: (header) => {
+        // Sanitize column names
+        return header
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9]/g, '_')
+          .replace(/^_+|_+$/g, '');
+      }
+    });
 
-    const planName = subscription?.plan_name || 'free'
-
-    const { data: planLimits, error: planError } = await supabase
-      .from('plan_limits')
-      .select('*')
-      .eq('plan_name', planName)
-      .single()
-
-    if (planError || !planLimits) {
-      return NextResponse.json({ error: 'Failed to get plan limits' }, { status: 500 })
+    if (parseResult.errors.length > 0) {
+      return NextResponse.json({
+        error: 'CSV parsing failed',
+        details: parseResult.errors
+      }, { status: 400 });
     }
 
-    const { data: projects, error: projectsError } = await supabase
-      .from('projects')
-      .select('id')
-      .eq('user_id', user.id)
+    const data = parseResult.data;
+    const columns = parseResult.meta.fields || [];
 
-    if (projectsError) {
-      return NextResponse.json({ error: 'Failed to check project limit' }, { status: 500 })
+    // Check row count limit (10,000 for free tier)
+    if (data.length > 10000) {
+      return NextResponse.json({
+        error: 'Too many rows. Free tier supports up to 10,000 rows'
+      }, { status: 400 });
     }
 
-    if (projects && projects.length >= planLimits.max_projects) {
-      return NextResponse.json({ error: 'Project limit reached. Upgrade your plan.' }, { status: 400 })
+    // Detect column types
+    const schema = detectSchema(data, columns);
+
+    // Create or get project
+    let project;
+    if (projectId) {
+      const { data: existingProject } = await supabaseAdmin
+        .from('projects')
+        .select('*')
+        .eq('id', projectId)
+        .eq('user_id', user.id)
+        .single();
+
+      project = existingProject;
+    } else {
+      // Check existing projects count
+      const { count: projectCount } = await supabaseAdmin
+        .from('projects')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', user.id);
+
+      // If user has reached project limit (1 for free tier), use existing project
+      if (projectCount && projectCount >= 1) {
+        const { data: existingProject } = await supabaseAdmin
+          .from('projects')
+          .select('*')
+          .eq('user_id', user.id)
+          .single();
+
+        if (existingProject) {
+          project = existingProject;
+        } else {
+          return NextResponse.json({ error: 'Failed to access existing project' }, { status: 500 });
+        }
+      } else {
+        // Create new project
+        const projectSlug = `project-${nanoid(8)}`;
+        const { data: newProject, error: projectError } = await supabaseAdmin
+          .from('projects')
+          .insert({
+            user_id: user.id,
+            name: file.name.replace('.csv', ''),
+            slug: projectSlug,
+            description: `Uploaded from ${file.name}`
+          })
+          .select()
+          .single();
+
+        if (projectError) {
+          console.error('Project creation error:', projectError);
+          return NextResponse.json({ error: 'Failed to create project' }, { status: 500 });
+        }
+
+        project = newProject;
+      }
     }
 
-    // Check CSV file count for this project (if updating existing project)
-    // For now, we'll create new projects, so this is fine
-
-    // Parse CSV
-    const parsedData = await parseCSV(file)
-
-    if (parsedData.errors.length > 0) {
-      return NextResponse.json({ error: `CSV parsing failed: ${parsedData.errors.join(', ')}` }, { status: 400 })
-    }
-
-    if (parsedData.rowCount > planLimits.max_rows_per_csv) {
-      return NextResponse.json({ error: `Too many rows. Maximum ${planLimits.max_rows_per_csv} rows allowed for your plan.` }, { status: 400 })
-    }
-
-    // Use provided schema or detected schema
-    const schema = schemaOverride ? JSON.parse(schemaOverride) : parsedData.schema
-
-    // Create project
-    const projectName = file.name.replace(/\.[^/.]+$/, '') // Remove extension
-    const projectSlug = slugify(projectName)
-
-    const { data: project, error: projectError } = await supabase
-      .from('projects')
-      .insert({
-        user_id: user.id,
-        name: projectName,
-        slug: projectSlug,
-        description: `Project for ${file.name}`,
-        is_active: true
-      })
-      .select()
-      .single()
-
-    if (projectError) {
-      return NextResponse.json({ error: 'Failed to create project' }, { status: 500 })
-    }
-
-    // Upload file to storage
-    const fileName = `${user.id}/${project.id}/${Date.now()}_${file.name}`
-    const { data: uploadData, error: uploadError } = await supabase.storage
+    // Upload original CSV to storage
+    const storagePath = `${user.id}/${project.id}/${file.name}`;
+    const { error: storageError } = await supabaseAdmin.storage
       .from('csv-uploads')
-      .upload(fileName, file)
+      .upload(storagePath, file, {
+        contentType: 'text/csv',
+        upsert: true
+      });
 
-    if (uploadError) {
-      return NextResponse.json({ error: 'Failed to upload file' }, { status: 500 })
+    if (storageError) {
+      console.error('Storage error:', storageError);
+      return NextResponse.json({ error: 'Failed to upload file' }, { status: 500 });
     }
 
-    // Create dynamic table
-    const tableName = generateTableName(project.id)
-    const tableResult = await createTable(tableName, schema)
-
-    if (!tableResult.success) {
-      return NextResponse.json({ error: `Failed to create table: ${tableResult.error}` }, { status: 500 })
-    }
-
-    // Insert data into table
-    const supabaseAdmin = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!
-    )
-
-    const { error: insertError } = await supabaseAdmin
-      .from(tableName)
-      .insert(parsedData.data)
-
-    if (insertError) {
-      return NextResponse.json({ error: 'Failed to insert data' }, { status: 500 })
-    }
-
-    // Save dataset metadata
-    const { data: dataset, error: datasetError } = await supabase
+    // Create dataset record
+    const datasetName = file.name.replace('.csv', '').toLowerCase().replace(/[^a-z0-9]/g, '_');
+    const { data: dataset, error: datasetError } = await supabaseAdmin
       .from('datasets')
       .insert({
         project_id: project.id,
-        table_name: tableName,
+        name: datasetName,
+        original_filename: file.name,
+        table_name: `csv_data`, // Always use the same table
         schema_json: schema,
-        row_count: parsedData.rowCount,
-        file_url: uploadData.path
+        row_count: data.length,
+        file_size_bytes: file.size,
+        file_url: storagePath
       })
       .select()
-      .single()
+      .single();
 
     if (datasetError) {
-      return NextResponse.json({ error: 'Failed to save dataset metadata' }, { status: 500 })
+      console.error('Dataset error:', datasetError);
+      return NextResponse.json({ error: 'Failed to create dataset' }, { status: 500 });
     }
 
-    // Generate API key
-    const apiKeyValue = `csv_${nanoid(32)}`
-    const { data: apiKey, error: apiKeyError } = await supabase
+    // Store data in csv_data table as JSONB
+    const csvRows = data.map((row: any, index: number) => ({
+      dataset_id: dataset.id,
+      row_number: index + 1,
+      data: row
+    }));
+
+    // Insert in batches of 500 to avoid size limits
+    const batchSize = 500;
+    for (let i = 0; i < csvRows.length; i += batchSize) {
+      const batch = csvRows.slice(i, i + batchSize);
+      const { error: insertError } = await supabaseAdmin
+        .from('csv_data')
+        .insert(batch);
+
+      if (insertError) {
+        console.error('Insert error:', insertError);
+        // Clean up on failure
+        await supabaseAdmin.from('datasets').delete().eq('id', dataset.id);
+        return NextResponse.json({ error: 'Failed to store CSV data' }, { status: 500 });
+      }
+    }
+
+    // Generate API key for this project
+    const apiKey = `csv_live_${nanoid(32)}`;
+    const apiKeyPrefix = apiKey.substring(0, 12) + '...';
+
+    // Simple hash for MVP (in production, use bcrypt)
+    const encoder = new TextEncoder();
+    const apiKeyBytes = encoder.encode(apiKey);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', apiKeyBytes);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const apiKeyHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+    const { error: apiKeyError } = await supabaseAdmin
       .from('api_keys')
       .insert({
         project_id: project.id,
-        key_hash: apiKeyValue // In production, hash this
-      })
-      .select()
-      .single()
+        name: 'Default Key',
+        key_prefix: apiKeyPrefix,
+        key_hash: apiKeyHash,
+        request_limit_per_month: 1000
+      });
 
     if (apiKeyError) {
-      return NextResponse.json({ error: 'Failed to generate API key' }, { status: 500 })
+      console.error('API key error:', apiKeyError);
     }
 
+    // Return success response
     return NextResponse.json({
       success: true,
-      datasetId: dataset.id,
-      tableName,
-      apiKey: apiKeyValue,
-      apiEndpoint: `/api/data/${project.slug}`,
-      projectId: project.id
-    })
+      project: {
+        id: project.id,
+        slug: project.slug
+      },
+      dataset: {
+        id: dataset.id,
+        name: dataset.name,
+        rows: data.length,
+        columns: columns.length
+      },
+      api: {
+        endpoint: `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/v1/${project.slug}/${datasetName}`,
+        key: apiKey,
+        example: `curl -H "Authorization: Bearer ${apiKey}" ${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/v1/${project.slug}/${datasetName}`
+      }
+    });
 
-  } catch (error: any) {
-    console.error('Upload error:', error)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  } catch (error) {
+    console.error('Upload error:', error);
+    return NextResponse.json({
+      error: 'Internal server error',
+      details: error instanceof Error ? error.message : 'Unknown error'
+    }, { status: 500 });
   }
+}
+
+function detectSchema(data: any[], columns: string[]) {
+  const schema: any = {};
+
+  for (const column of columns) {
+    const samples = data
+      .slice(0, Math.min(100, data.length))
+      .map(row => row[column])
+      .filter(val => val != null && val !== '');
+
+    schema[column] = detectType(samples);
+  }
+
+  return schema;
+}
+
+function detectType(samples: any[]): string {
+  if (samples.length === 0) return 'text';
+
+  // Check if all samples are booleans
+  if (samples.every(s =>
+    typeof s === 'boolean' ||
+    ['true', 'false', 'yes', 'no', '1', '0'].includes(String(s).toLowerCase())
+  )) {
+    return 'boolean';
+  }
+
+  // Check if all samples are integers
+  if (samples.every(s => Number.isInteger(Number(s)))) {
+    return 'integer';
+  }
+
+  // Check if all samples are numbers
+  if (samples.every(s => !isNaN(Number(s)))) {
+    return 'number';
+  }
+
+  // Check if all samples are dates
+  if (samples.every(s => !isNaN(Date.parse(s)))) {
+    return 'date';
+  }
+
+  // Check if all samples are emails
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (samples.every(s => emailRegex.test(String(s)))) {
+    return 'email';
+  }
+
+  // Check if all samples are URLs
+  const urlRegex = /^(https?:\/\/)?([\da-z\.-]+)\.([a-z\.]{2,6})([\/\w \.-]*)*\/?$/;
+  if (samples.every(s => urlRegex.test(String(s)))) {
+    return 'url';
+  }
+
+  return 'text';
 }

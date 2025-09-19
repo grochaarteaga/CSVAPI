@@ -45,6 +45,13 @@ export async function GET(request: NextRequest) {
     }
   }
 
+  // Check if this is a magic link (tokens in hash)
+  if (hash && (hash.includes('access_token') || hash.includes('type=magiclink'))) {
+    console.log('🔗 Magic link detected, redirecting to login page for processing')
+    // Redirect to login page which will handle the magic link tokens
+    return NextResponse.redirect(`${origin}/login${new URL(url).search}`)
+  }
+
   if (code) {
     console.log('✅ Found auth code, attempting to exchange for session')
     const supabase = createClient(
@@ -67,13 +74,13 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  console.log('⚠️ CRITICAL: No authentication data received from Supabase')
-  console.log('🔧 This indicates a Supabase configuration issue')
+  console.log('ℹ️ No OAuth code or magic link tokens found')
+  console.log('🔧 This might indicate a configuration issue or the auth flow is being handled elsewhere')
   console.log('📋 Check these in Supabase Dashboard:')
   console.log('   - Authentication → URL Configuration')
   console.log('   - Site URL: http://localhost:3000')
-  console.log('   - Redirect URLs: http://localhost:3000/auth/callback')
+  console.log('   - Make sure magic link redirect is working properly')
 
-  // Return the user to login page with generic error
-  return NextResponse.redirect(`${origin}/login?error=auth`)
+  // Return the user to login page
+  return NextResponse.redirect(`${origin}/login`)
 }

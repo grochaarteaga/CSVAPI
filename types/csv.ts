@@ -24,6 +24,8 @@ export interface Project {
   datasetCount: number
   apiCallsThisMonth: number
   createdAt: string
+  datasets?: any[]
+  apiKey?: string
 }
 
 export type { ColumnSchema, ColumnType }

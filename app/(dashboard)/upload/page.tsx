@@ -42,14 +42,36 @@ export default function UploadPage() {
     setUploadProgress(0)
 
     try {
-      const { data: { session } } = await supabase.auth.getSession()
+      let { data: { session } } = await supabase.auth.getSession()
       if (!session) {
         throw new Error('Not authenticated')
+      }
+
+      // Debug: Check token expiration
+      const expiresAt = new Date(session.expires_at! * 1000)
+      const now = new Date()
+      console.log('Token expires at:', expiresAt)
+      console.log('Current time:', now)
+      console.log('Token expired:', expiresAt < now)
+
+      if (expiresAt < now) {
+        console.log('Token expired, attempting refresh...')
+        const { data: refreshData, error: refreshError } = await supabase.auth.refreshSession()
+
+        if (refreshError || !refreshData.session) {
+          throw new Error('Session expired. Please log in again.')
+        }
+
+        console.log('Token refreshed successfully')
+        // Update the session with refreshed data
+        session = refreshData.session
       }
 
       const formData = new FormData()
       formData.append('file', file)
       formData.append('schema', JSON.stringify(parsedData.schema))
+
+      console.log('Sending upload request with token:', session.access_token.substring(0, 20) + '...')
 
       const response = await fetch('/api/upload', {
         method: 'POST',

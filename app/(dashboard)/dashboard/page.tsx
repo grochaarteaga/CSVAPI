@@ -17,50 +17,55 @@ export default function DashboardPage() {
       const { data: { user } } = await supabase.auth.getUser()
       if (!user) return
 
-      // Fetch projects
-      const { data: projectsData } = await supabase
-        .from('projects')
-        .select(`
-          id,
-          name,
-          slug,
-          created_at
-        `)
-        .eq('user_id', user.id)
+      // Fetch projects with datasets and API keys
+     const { data: projectsData } = await supabase
+       .from('projects')
+       .select(`
+         id,
+         name,
+         slug,
+         created_at,
+         datasets (
+           id,
+           name,
+           row_count
+         ),
+         api_keys (
+           id,
+           key_prefix,
+           request_count,
+           request_limit_per_month
+         )
+       `)
+       .eq('user_id', user.id)
 
-      if (projectsData) {
-        // Get dataset counts for each project
-        const projectsWithCounts = await Promise.all(
-          projectsData.map(async (project) => {
-            const { count: datasetCount } = await supabase
-              .from('datasets')
-              .select('*', { count: 'exact', head: true })
-              .eq('project_id', project.id)
+     if (projectsData) {
+       const projectsWithDetails = projectsData.map((project) => {
+         const datasetCount = project.datasets?.length || 0;
+         const totalApiCalls = project.api_keys?.reduce((sum, key) => sum + (key.request_count || 0), 0) || 0;
+         const apiKey = project.api_keys?.[0]; // Get first API key for examples
 
-            // Get API calls this month
-            const startOfMonth = new Date()
-            startOfMonth.setDate(1)
-            startOfMonth.setHours(0, 0, 0, 0)
+         // Get API calls this month
+         const startOfMonth = new Date()
+         startOfMonth.setDate(1)
+         startOfMonth.setHours(0, 0, 0, 0)
 
-            const { count: apiCallsThisMonth } = await supabase
-              .from('usage_logs')
-              .select('*', { count: 'exact', head: true })
-              .eq('project_id', project.id)
-              .gte('created_at', startOfMonth.toISOString())
+         // Note: We can't easily get monthly calls without additional query, so we'll show total for now
 
-            return {
-              id: project.id,
-              name: project.name,
-              slug: project.slug,
-              description: `Project created on ${new Date(project.created_at).toLocaleDateString()}`,
-              datasetCount: datasetCount || 0,
-              apiCallsThisMonth: apiCallsThisMonth || 0,
-              createdAt: project.created_at
-            }
-          })
-        )
-        setProjects(projectsWithCounts)
-      }
+         return {
+           id: project.id,
+           name: project.name,
+           slug: project.slug,
+           description: `Project created on ${new Date(project.created_at).toLocaleDateString()}`,
+           datasetCount,
+           apiCallsThisMonth: totalApiCalls, // Using total calls as approximation
+           datasets: project.datasets || [],
+           apiKey: apiKey?.key_prefix ? `${apiKey.key_prefix}` : undefined,
+           createdAt: project.created_at
+         }
+       })
+       setProjects(projectsWithDetails)
+     }
 
       setLoading(false)
     }
@@ -116,7 +121,7 @@ export default function DashboardPage() {
                 <CardDescription>{project.description}</CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="flex items-center justify-between text-sm text-gray-600">
+                <div className="flex items-center justify-between text-sm text-gray-600 mb-3">
                   <div className="flex items-center">
                     <Database className="h-4 w-4 mr-1" />
                     {project.datasetCount} datasets
@@ -126,6 +131,26 @@ export default function DashboardPage() {
                     {project.apiCallsThisMonth} calls
                   </div>
                 </div>
+
+                {project.datasets && project.datasets.length > 0 && project.apiKey && (
+                  <div className="border-t pt-3">
+                    <p className="text-xs font-medium text-gray-700 mb-2">API Examples:</p>
+                    {project.datasets.slice(0, 2).map((dataset) => (
+                      <div key={dataset.id} className="mb-2">
+                        <p className="text-xs text-gray-600 font-mono bg-gray-50 p-2 rounded">
+                          GET /api/v1/{project.slug}/{dataset.name}
+                        </p>
+                        <p className="text-xs text-gray-500 mt-1">
+                          {dataset.row_count} rows
+                        </p>
+                      </div>
+                    ))}
+                    <p className="text-xs text-gray-600 mt-2">
+                      Use API key: <code className="bg-gray-50 px-1 rounded">{project.apiKey}</code>
+                    </p>
+                  </div>
+                )}
+
                 <p className="text-xs text-gray-500 mt-2">
                   Created {new Date(project.createdAt).toLocaleDateString()}
                 </p>

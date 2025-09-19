@@ -1,4 +1,4 @@
-import Papa from 'papaparse'
+import { parse } from 'csv-parse'
 import { detectColumnType, sanitizeColumnName, ColumnSchema, ColumnType } from './type-detector'
 
 export interface ParsedCSV {
@@ -9,25 +9,24 @@ export interface ParsedCSV {
 }
 
 export async function parseCSV(file: File): Promise<ParsedCSV> {
-  return new Promise((resolve, reject) => {
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      complete: (results) => {
-        try {
-          const { data: rawData, errors } = results
-          const data = rawData as any[]
+  try {
+    // Convert File to buffer
+    const buffer = await file.arrayBuffer()
+    const csvString = Buffer.from(buffer).toString('utf-8')
 
-          if (errors.length > 0) {
-            const errorMessages = errors.map(err => err.message)
-            resolve({
-              data: [],
-              schema: [],
-              rowCount: 0,
-              errors: errorMessages
-            })
-            return
-          }
+    return new Promise((resolve, reject) => {
+      parse(csvString, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true
+      }, (err, records) => {
+        if (err) {
+          reject(err)
+          return
+        }
+
+        try {
+          const data = records as any[]
 
           if (data.length === 0) {
             resolve({
@@ -64,10 +63,9 @@ export async function parseCSV(file: File): Promise<ParsedCSV> {
         } catch (error) {
           reject(error)
         }
-      },
-      error: (error) => {
-        reject(error)
-      }
+      })
     })
-  })
+  } catch (error) {
+    return Promise.reject(error)
+  }
 }

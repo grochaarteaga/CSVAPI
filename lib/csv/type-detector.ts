@@ -14,17 +14,7 @@ export function detectColumnType(values: any[]): ColumnType {
 
   if (sampleValues.length === 0) return 'TEXT'
 
-  // Check if all are integers
-  if (sampleValues.every(val => isValidInteger(val))) {
-    return 'INTEGER'
-  }
-
-  // Check if all are numbers
-  if (sampleValues.every(val => isValidNumber(val))) {
-    return 'FLOAT'
-  }
-
-  // Check if all are dates
+  // Check if all are dates FIRST (before numbers to avoid date strings being classified as numbers)
   if (sampleValues.every(val => isValidDate(val))) {
     return 'DATE'
   }
@@ -34,6 +24,16 @@ export function detectColumnType(values: any[]): ColumnType {
     return 'BOOLEAN'
   }
 
+  // Check if all are integers (but exclude date-like strings)
+  if (sampleValues.every(val => isValidInteger(val))) {
+    return 'INTEGER'
+  }
+
+  // Check if all are numbers
+  if (sampleValues.every(val => isValidNumber(val))) {
+    return 'FLOAT'
+  }
+
   // Default to TEXT
   return 'TEXT'
 }
@@ -41,8 +41,12 @@ export function detectColumnType(values: any[]): ColumnType {
 function isValidInteger(value: any): boolean {
   if (typeof value === 'number') return Number.isInteger(value)
   if (typeof value === 'string') {
+    // Exclude strings that look like dates (contain hyphens, slashes, or other date separators)
+    if (value.includes('-') || value.includes('/') || value.includes('.')) {
+      return false
+    }
     const num = parseFloat(value)
-    return !isNaN(num) && Number.isInteger(num)
+    return !isNaN(num) && Number.isInteger(num) && num.toString() === value.trim()
   }
   return false
 }
