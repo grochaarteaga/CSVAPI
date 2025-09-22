@@ -6,29 +6,51 @@ const supabaseAdmin = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
+interface ApiResponse {
+  success: boolean;
+  data?: any[];
+  error?: string;
+  pagination?: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
+  meta?: {
+    columns: string[];
+    types: Record<string, string>;
+    queryTime: number;
+  };
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ project: string; dataset: string }> }
-) {
+): Promise<NextResponse<ApiResponse>> {
+  const startTime = Date.now();
+
   try {
     const resolvedParams = await params;
 
-    // Get API key from header
+    // Extract and validate API key
     const authHeader = request.headers.get('authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return NextResponse.json({ error: 'API key required' }, { status: 401 });
+    if (!authHeader?.startsWith('Bearer ')) {
+      return NextResponse.json(
+        { success: false, error: 'Missing or invalid API key' },
+        { status: 401 }
+      );
     }
 
-    const apiKey = authHeader.replace('Bearer ', '');
+    const apiKey = authHeader.substring(7);
 
-    // Hash the API key to compare with stored hash
+    // Hash API key for comparison
     const encoder = new TextEncoder();
-    const apiKeyBytes = encoder.encode(apiKey);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', apiKeyBytes);
+    const data = encoder.encode(apiKey);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     const apiKeyHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 
-    // Validate API key and get project
+    // Validate API key and get associated project
     const { data: keyData, error: keyError } = await supabaseAdmin
       .from('api_keys')
       .select(`
@@ -36,7 +58,7 @@ export async function GET(
         project_id,
         request_count,
         request_limit_per_month,
-        projects!inner(
+        projects!inner (
           id,
           slug,
           user_id
@@ -47,84 +69,64 @@ export async function GET(
       .single();
 
     if (keyError || !keyData) {
-      return NextResponse.json({ error: 'Invalid API key' }, { status: 401 });
+      await logRequest(null, null, resolvedParams, 401, 'Invalid API key');
+      return NextResponse.json(
+        { success: false, error: 'Invalid or inactive API key' },
+        { status: 401 }
+      );
     }
 
-    // Check rate limit
+    // Check rate limits
     if (keyData.request_count >= keyData.request_limit_per_month) {
-      return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 });
+      await logRequest(keyData.id, keyData.project_id, resolvedParams, 429, 'Rate limit exceeded');
+      return NextResponse.json(
+        { success: false, error: 'Monthly API limit exceeded' },
+        { status: 429 }
+      );
     }
 
-    // Check if project slug matches
+    // Verify project slug matches
     if ((keyData.projects as any).slug !== resolvedParams.project) {
-      return NextResponse.json({ error: 'Invalid project' }, { status: 403 });
+      await logRequest(keyData.id, keyData.project_id, resolvedParams, 403, 'Project mismatch');
+      return NextResponse.json(
+        { success: false, error: 'API key does not match project' },
+        { status: 403 }
+      );
     }
 
-    // Get dataset
+    // Get dataset information
     const { data: dataset, error: datasetError } = await supabaseAdmin
       .from('datasets')
-      .select('id, schema_json, row_count')
+      .select('id, name, schema_json, row_count')
       .eq('project_id', keyData.project_id)
       .eq('name', resolvedParams.dataset)
       .single();
 
     if (datasetError || !dataset) {
-      return NextResponse.json({ error: 'Dataset not found' }, { status: 404 });
+      await logRequest(keyData.id, keyData.project_id, resolvedParams, 404, 'Dataset not found');
+      return NextResponse.json(
+        { success: false, error: 'Dataset not found' },
+        { status: 404 }
+      );
     }
 
     // Parse query parameters
     const url = new URL(request.url);
-    const page = parseInt(url.searchParams.get('page') || '1');
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '100'), 1000);
-    const sort = url.searchParams.get('sort');
-    const order = url.searchParams.get('order') || 'asc';
-    const search = url.searchParams.get('q');
+    const queryParams = parseQueryParams(url.searchParams);
 
-    // Build query
-    let query = supabaseAdmin
-      .from('csv_data')
-      .select('data, row_number')
-      .eq('dataset_id', dataset.id);
-
-    // Apply filters
-    const filters: Record<string, string> = {};
-    url.searchParams.forEach((value, key) => {
-      if (!['page', 'limit', 'sort', 'order', 'q'].includes(key)) {
-        filters[key] = value;
-      }
-    });
-
-    // Apply JSONB filters
-    for (const [key, value] of Object.entries(filters)) {
-      // Use JSONB containment for filtering
-      query = query.filter('data', '@>', JSON.stringify({ [key]: value }));
-    }
-
-    // Apply search if provided
-    if (search) {
-      // Search across all JSONB fields (case-insensitive)
-      query = query.filter('data', 'ilike', `%${search}%`);
-    }
-
-    // Apply sorting
-    if (sort) {
-      // Sort by JSONB field
-      query = query.order('data->' + sort, { ascending: order === 'asc' });
-    } else {
-      // Default sort by row_number
-      query = query.order('row_number', { ascending: true });
-    }
-
-    // Apply pagination
-    const offset = (page - 1) * limit;
-    query = query.range(offset, offset + limit - 1);
-
-    // Execute query
-    const { data: rows, error: queryError } = await query;
+    // Build and execute query
+    const { data: rows, error: queryError, count } = await executeQuery(
+      dataset.id,
+      queryParams,
+      dataset.schema_json
+    );
 
     if (queryError) {
-      console.error('Query error:', queryError);
-      return NextResponse.json({ error: 'Query failed' }, { status: 500 });
+      await logRequest(keyData.id, keyData.project_id, resolvedParams, 500, queryError.message);
+      return NextResponse.json(
+        { success: false, error: 'Query execution failed' },
+        { status: 500 }
+      );
     }
 
     // Update API key usage
@@ -136,41 +138,160 @@ export async function GET(
       })
       .eq('id', keyData.id);
 
-    // Log the request
-    await supabaseAdmin
-      .from('usage_logs')
-      .insert({
-        api_key_id: keyData.id,
-        project_id: keyData.project_id,
-        endpoint: `/api/v1/${resolvedParams.project}/${resolvedParams.dataset}`,
-        method: 'GET',
-        status_code: 200,
-        ip_address: request.headers.get('x-forwarded-for') || 'unknown',
-        user_agent: request.headers.get('user-agent') || 'unknown',
-        query_params: Object.fromEntries(url.searchParams)
-      });
+    // Log successful request
+    const queryTime = Date.now() - startTime;
+    await logRequest(
+      keyData.id,
+      keyData.project_id,
+      resolvedParams,
+      200,
+      null,
+      queryParams,
+      queryTime
+    );
 
-    // Format response
-    return NextResponse.json({
+    // Format and return response
+    const response: ApiResponse = {
       success: true,
       data: rows?.map(r => r.data) || [],
       pagination: {
-        page,
-        limit,
-        total: dataset.row_count,
-        totalPages: Math.ceil(dataset.row_count / limit)
+        page: queryParams.page,
+        limit: queryParams.limit,
+        total: count || dataset.row_count,
+        totalPages: Math.ceil((count || dataset.row_count) / queryParams.limit)
       },
       meta: {
         columns: Object.keys(dataset.schema_json || {}),
-        types: dataset.schema_json
+        types: dataset.schema_json || {},
+        queryTime
       }
-    });
+    };
+
+    return NextResponse.json(response);
 
   } catch (error) {
-    console.error('API error:', error);
-    return NextResponse.json({
-      error: 'Internal server error',
-      details: error instanceof Error ? error.message : 'Unknown error'
-    }, { status: 500 });
+    console.error('API endpoint error:', error);
+    return NextResponse.json(
+      {
+        success: false,
+        error: 'Internal server error',
+        details: error instanceof Error ? error.message : undefined
+      },
+      { status: 500 }
+    );
+  }
+}
+
+// Helper function to parse query parameters
+function parseQueryParams(searchParams: URLSearchParams) {
+  const params: any = {
+    page: parseInt(searchParams.get('page') || '1'),
+    limit: Math.min(parseInt(searchParams.get('limit') || '100'), 1000),
+    sort: searchParams.get('sort'),
+    order: searchParams.get('order') || 'asc',
+    search: searchParams.get('q'),
+    fields: searchParams.get('fields')?.split(',').map(f => f.trim()),
+    filters: {} as Record<string, any>
+  };
+
+  // Extract filters (any param not in reserved list)
+  const reserved = ['page', 'limit', 'sort', 'order', 'q', 'fields'];
+  searchParams.forEach((value, key) => {
+    if (!reserved.includes(key)) {
+      // Handle range filters (e.g., price_min, price_max)
+      if (key.endsWith('_min') || key.endsWith('_max')) {
+        const field = key.replace(/_min$|_max$/, '');
+        if (!params.filters[field]) params.filters[field] = {};
+        params.filters[field][key.endsWith('_min') ? 'min' : 'max'] = value;
+      } else {
+        params.filters[key] = value;
+      }
+    }
+  });
+
+  return params;
+}
+
+// Helper function to execute database query
+async function executeQuery(
+  datasetId: string,
+  params: any,
+  schema: Record<string, string>
+) {
+  let query = supabaseAdmin
+    .from('csv_data')
+    .select('data, row_number', { count: 'exact' })
+    .eq('dataset_id', datasetId);
+
+  // Apply filters
+  for (const [field, value] of Object.entries(params.filters)) {
+    if (typeof value === 'object' && value !== null) {
+      // Range filter
+      const rangeVal = value as { min?: string; max?: string };
+      if (rangeVal.min) {
+        query = query.gte(`data->>${field}`, rangeVal.min);
+      }
+      if (rangeVal.max) {
+        query = query.lte(`data->>${field}`, rangeVal.max);
+      }
+    } else {
+      // Exact match filter
+      query = query.eq(`data->>${field}`, value);
+    }
+  }
+
+  // Apply search across all text fields
+  if (params.search) {
+    const searchConditions = Object.keys(schema)
+      .filter(key => schema[key] === 'text' || schema[key] === 'string')
+      .map(key => `data->>${key}.ilike.%${params.search}%`)
+      .join(',');
+
+    if (searchConditions) {
+      query = query.or(searchConditions);
+    }
+  }
+
+  // Apply sorting
+  if (params.sort) {
+    const column = `data->>${params.sort}`;
+    query = query.order(column, { ascending: params.order === 'asc' });
+  } else {
+    query = query.order('row_number', { ascending: true });
+  }
+
+  // Apply pagination
+  const from = (params.page - 1) * params.limit;
+  const to = from + params.limit - 1;
+  query = query.range(from, to);
+
+  return query;
+}
+
+// Helper function to log API requests
+async function logRequest(
+  apiKeyId: string | null,
+  projectId: string | null,
+  params: { project: string; dataset: string },
+  statusCode: number,
+  errorMessage: string | null = null,
+  queryParams: any = null,
+  responseTime: number = 0
+) {
+  try {
+    await supabaseAdmin
+      .from('usage_logs')
+      .insert({
+        api_key_id: apiKeyId,
+        project_id: projectId,
+        endpoint: `/api/v1/${params.project}/${params.dataset}`,
+        method: 'GET',
+        status_code: statusCode,
+        response_time_ms: responseTime,
+        error_message: errorMessage,
+        query_params: queryParams
+      });
+  } catch (error) {
+    console.error('Failed to log request:', error);
   }
 }
